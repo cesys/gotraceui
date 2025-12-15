@@ -923,6 +923,10 @@ func processEvents(r *exptrace.Reader, tr *Trace, progress func(float64)) error 
 						s.State = StateBlocked
 					case "wait until GC ends":
 						s.State = StateBlockedGC
+					case "GC weak to strong wait":
+						s.State = StateBlocked
+					case "synctest":
+						s.State = StateBlocked
 					case "":
 						s.State = StateBlocked
 					default:
