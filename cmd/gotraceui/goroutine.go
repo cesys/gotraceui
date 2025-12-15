@@ -745,7 +745,7 @@ func (gs *GoroutineList) Layout(win *theme.Window, gtx layout.Context) layout.Di
 			}
 			return gs.cellFormatter.Timestamp(win, gtx, gs.Trace, ts, l)
 		case "Duration": // Duration
-			// If the goroutine's end wasn't observed, then traceEnd is equal to the trace's end
+			traceStart := g.EffectiveStart()
 			traceEnd := g.EffectiveEnd()
 
 			start, sok := g.Start.Get()
@@ -754,10 +754,10 @@ func (gs *GoroutineList) Layout(win *theme.Window, gtx layout.Context) layout.Di
 			var d time.Duration
 			var approx bool
 			if !sok && !eok {
-				d = time.Duration(traceEnd)
+				d = time.Duration(traceEnd - traceStart)
 				approx = true
 			} else if !sok {
-				d = time.Duration(end)
+				d = time.Duration(end - traceStart)
 				approx = true
 			} else if !eok {
 				d = time.Duration(traceEnd - start)
