@@ -692,6 +692,10 @@ func (cv *Canvas) Layout(win *theme.Window, gtx layout.Context) layout.Dimension
 	win.AddShortcut(theme.Shortcut{Name: key.NameHome})
 	win.AddShortcut(theme.Shortcut{Name: key.NameHome, Modifiers: key.ModShortcut})
 	win.AddShortcut(theme.Shortcut{Name: key.NameHome, Modifiers: key.ModShift})
+	win.AddShortcut(theme.Shortcut{Name: key.NamePageUp})
+	win.AddShortcut(theme.Shortcut{Name: key.NamePageDown})
+	win.AddShortcut(theme.Shortcut{Name: key.NameUpArrow})
+	win.AddShortcut(theme.Shortcut{Name: key.NameDownArrow})
 	win.AddShortcut(theme.Shortcut{Name: "S"})
 	win.AddShortcut(theme.Shortcut{Name: "Z", Modifiers: key.ModShortcut})
 	win.AddShortcut(theme.Shortcut{Name: "Y", Modifiers: key.ModShortcut})
@@ -710,6 +714,52 @@ func (cv *Canvas) Layout(win *theme.Window, gtx layout.Context) layout.Dimension
 
 		case theme.Shortcut{Name: key.NameHome, Modifiers: key.ModShift}:
 			cv.JumpToBeginning(gtx)
+
+		case theme.Shortcut{Name: key.NamePageUp}:
+			cv.abortZoomSelection()
+			cv.scroll(gtx, 0, -float32(gtx.Constraints.Max.Y))
+
+		case theme.Shortcut{Name: key.NamePageDown}:
+			cv.abortZoomSelection()
+			cv.scroll(gtx, 0, float32(gtx.Constraints.Max.Y))
+
+		case theme.Shortcut{Name: key.NameUpArrow}:
+			cv.abortZoomSelection()
+			cv.cancelNavigation()
+			cv.computeTimelinePositions(gtx)
+			if len(cv.timelineEnds) != 0 {
+				yPx := cv.denormalizeY(gtx, cv.y)
+				curIdx := sort.Search(len(cv.timelineEnds), func(i int) bool { return cv.timelineEnds[i] > yPx })
+				if curIdx < len(cv.timelineEnds) {
+					curStart := 0
+					if curIdx > 0 {
+						curStart = cv.timelineEnds[curIdx-1]
+					}
+					targetStart := curStart
+					// If we're already aligned to the start of the current timeline, move to the previous one.
+					if yPx == curStart && curIdx > 0 {
+						if curIdx-1 > 0 {
+							targetStart = cv.timelineEnds[curIdx-2]
+						} else {
+							targetStart = 0
+						}
+					}
+					cv.y = cv.normalizeY(gtx, targetStart)
+				}
+			}
+
+		case theme.Shortcut{Name: key.NameDownArrow}:
+			cv.abortZoomSelection()
+			cv.cancelNavigation()
+			cv.computeTimelinePositions(gtx)
+			if len(cv.timelineEnds) != 0 {
+				yPx := cv.denormalizeY(gtx, cv.y)
+				curIdx := sort.Search(len(cv.timelineEnds), func(i int) bool { return cv.timelineEnds[i] > yPx })
+				if curIdx < len(cv.timelineEnds) {
+					targetStart := cv.timelineEnds[curIdx]
+					cv.y = cv.normalizeY(gtx, targetStart)
+				}
+			}
 
 		case theme.Shortcut{Name: "S"}:
 			cv.ToggleStackTracks()
