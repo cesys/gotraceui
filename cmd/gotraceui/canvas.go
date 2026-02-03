@@ -41,11 +41,19 @@ type showTooltips uint8
 type normalizedY float64
 
 func (cv *Canvas) denormalizeY(gtx layout.Context, y normalizedY) int {
-	return int(math.Round(float64(cv.height(gtx)) * float64(y)))
+	h := cv.height(gtx)
+	if h <= 0 {
+		return 0
+	}
+	return int(math.Round(float64(h) * float64(y)))
 }
 
 func (cv *Canvas) normalizeY(gtx layout.Context, y int) normalizedY {
-	return normalizedY(float64(y) / float64(cv.height(gtx)))
+	h := cv.height(gtx)
+	if h <= 0 {
+		return 0
+	}
+	return normalizedY(float64(y) / float64(h))
 }
 
 const (
@@ -214,6 +222,30 @@ type Canvas struct {
 	textures TextureManager
 }
 
+func (cv *Canvas) pinnedGCTimeline() *Timeline {
+	if len(cv.timelines) == 0 {
+		return nil
+	}
+	if _, ok := cv.timelines[0].item.(*GC); ok {
+		return cv.timelines[0]
+	}
+	return nil
+}
+
+func (cv *Canvas) pinnedTimelineHeight(gtx layout.Context) int {
+	if tl := cv.pinnedGCTimeline(); tl != nil {
+		return tl.Height(gtx, cv)
+	}
+	return 0
+}
+
+func (cv *Canvas) scrollTimelines() []*Timeline {
+	if cv.pinnedGCTimeline() != nil {
+		return cv.timelines[1:]
+	}
+	return cv.timelines
+}
+
 func NewCanvasInto(cv *Canvas, dwin *DebugWindow, t *Trace) {
 	*cv = Canvas{
 		resizeMemoryTimelines: component.Resize{
@@ -248,16 +280,17 @@ func (cv *Canvas) End() exptrace.Time {
 }
 
 func (cv *Canvas) computeTimelinePositions(gtx layout.Context) {
-	if len(cv.timelineEnds) == len(cv.timelines) &&
+	scrollTls := cv.scrollTimelines()
+	if len(cv.timelineEnds) == len(scrollTls) &&
 		cv.timeline.compact == cv.prevFrame.compact &&
 		cv.timeline.displayStackTracks == cv.prevFrame.displayStackTracks &&
 		gtx.Metric == cv.prevFrame.metric {
 		return
 	}
 
-	cv.timelineEnds = mem.GrowLen(cv.timelineEnds[:0], len(cv.timelines))
+	cv.timelineEnds = mem.GrowLen(cv.timelineEnds[:0], len(scrollTls))
 	accEnds := 0
-	for i, tl := range cv.timelines {
+	for i, tl := range scrollTls {
 		accEnds += tl.Height(gtx, cv)
 		cv.timelineEnds[i] = accEnds
 	}
@@ -495,7 +528,20 @@ func (cv *Canvas) pxToTs(px float32) exptrace.Time {
 func (cv *Canvas) ZoomToFitCurrentView(gtx layout.Context) {
 	var first, last exptrace.Time = -1, -1
 	start, end := cv.visibleTimelines(gtx)
-	for _, tl := range cv.timelines[start:end] {
+	if pinned := cv.pinnedGCTimeline(); pinned != nil {
+		for _, track := range pinned.tracks {
+			if track.kind == TrackKindStack && !cv.timeline.displayStackTracks {
+				continue
+			}
+			if t := track.Start; t < first || first == -1 {
+				first = t
+			}
+			if t := track.End; t > last {
+				last = t
+			}
+		}
+	}
+	for _, tl := range cv.scrollTimelines()[start:end] {
 		for _, track := range tl.tracks {
 			if track.kind == TrackKindStack && !cv.timeline.displayStackTracks {
 				continue
@@ -517,9 +563,12 @@ func (cv *Canvas) ZoomToFitCurrentView(gtx layout.Context) {
 }
 
 func (cv *Canvas) timelineY(gtx layout.Context, dst *Timeline) normalizedY {
+	if dst == cv.pinnedGCTimeline() {
+		return 0
+	}
 	// OPT(dh): don't be O(n)
 	off := 0
-	for _, tl := range cv.timelines {
+	for _, tl := range cv.scrollTimelines() {
 		if tl == dst {
 			// TODO(dh): show goroutine at center of window, not the top
 			return cv.normalizeY(gtx, off)
@@ -530,9 +579,12 @@ func (cv *Canvas) timelineY(gtx layout.Context, dst *Timeline) normalizedY {
 }
 
 func (cv *Canvas) objectY(gtx layout.Context, act any) normalizedY {
+	if pinned := cv.pinnedGCTimeline(); pinned != nil && act == pinned.item {
+		return 0
+	}
 	// OPT(dh): don't be O(n)
 	off := 0
-	for _, tl := range cv.timelines {
+	for _, tl := range cv.scrollTimelines() {
 		if act == tl.item {
 			// TODO(dh): show goroutine at center of window, not the top
 			return cv.normalizeY(gtx, off)
@@ -569,7 +621,8 @@ func (cv *Canvas) height(gtx layout.Context) int {
 	}
 
 	// OPT(dh): reuse slice
-	totals, _ := syncutil.Map(cv.timelines, 0, nil, func(subitems []*Timeline) (int, error) {
+	scrollTls := cv.scrollTimelines()
+	totals, _ := syncutil.Map(scrollTls, 0, nil, func(subitems []*Timeline) (int, error) {
 		total := 0
 		for _, tl := range subitems {
 			total += tl.Height(gtx, cv)
@@ -717,11 +770,19 @@ func (cv *Canvas) Layout(win *theme.Window, gtx layout.Context) layout.Dimension
 
 		case theme.Shortcut{Name: key.NamePageUp}:
 			cv.abortZoomSelection()
-			cv.scroll(gtx, 0, -float32(gtx.Constraints.Max.Y))
+			viewH := gtx.Constraints.Max.Y - cv.pinnedTimelineHeight(gtx)
+			if viewH < 0 {
+				viewH = 0
+			}
+			cv.scroll(gtx, 0, -float32(viewH))
 
 		case theme.Shortcut{Name: key.NamePageDown}:
 			cv.abortZoomSelection()
-			cv.scroll(gtx, 0, float32(gtx.Constraints.Max.Y))
+			viewH := gtx.Constraints.Max.Y - cv.pinnedTimelineHeight(gtx)
+			if viewH < 0 {
+				viewH = 0
+			}
+			cv.scroll(gtx, 0, float32(viewH))
 
 		case theme.Shortcut{Name: key.NameUpArrow}:
 			cv.abortZoomSelection()
@@ -1055,13 +1116,22 @@ func (cv *Canvas) Layout(win *theme.Window, gtx layout.Context) layout.Dimension
 
 							// Scrollbar
 							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								pinnedH := cv.pinnedTimelineHeight(gtx)
 								totalHeight := cv.height(gtx)
-								if len(cv.timelines) > 0 {
+								scrollTls := cv.scrollTimelines()
+								if len(scrollTls) > 0 {
 									// Allow scrolling past the last goroutine
-									totalHeight += cv.timelines[len(cv.timelines)-1].Height(gtx, cv)
+									totalHeight += scrollTls[len(scrollTls)-1].Height(gtx, cv)
 								}
 
-								fraction := float32(gtx.Constraints.Max.Y) / float32(totalHeight)
+								viewH := gtx.Constraints.Max.Y - pinnedH
+								if viewH < 0 {
+									viewH = 0
+								}
+								fraction := float32(1)
+								if totalHeight > 0 {
+									fraction = float32(viewH) / float32(totalHeight)
+								}
 								sb := theme.Scrollbar(win.Theme, &cv.scrollbar)
 								return sb.Layout(win, gtx, layout.Vertical, float32(cv.y), float32(cv.y)+fraction)
 							}),
@@ -1206,33 +1276,49 @@ func (cv *Canvas) Layout(win *theme.Window, gtx layout.Context) layout.Dimension
 }
 
 func (cv *Canvas) visibleTimelines(gtx layout.Context) (start, end int) {
+	pinnedH := cv.pinnedTimelineHeight(gtx)
+	viewH := gtx.Constraints.Max.Y - pinnedH
+	if viewH < 0 {
+		viewH = 0
+	}
+
+	tls := cv.scrollTimelines()
+	if len(tls) == 0 {
+		return 0, 0
+	}
+
 	cvy := cv.denormalizeY(gtx, cv.y)
 	// start at first timeline that ends within or after the visible range
 	// end at first timeline that starts after the visible range
-	start = sort.Search(len(cv.timelines), func(i int) bool {
+	start = sort.Search(len(tls), func(i int) bool {
 		return cv.timelineEnds[i]-cvy >= 0
 	})
-	end = sort.Search(len(cv.timelines), func(i int) bool {
+	end = sort.Search(len(tls), func(i int) bool {
 		start := 0
 		if i != 0 {
 			start = cv.timelineEnds[i-1]
 		}
-		return start-cvy >= gtx.Constraints.Max.Y
+		return start-cvy >= viewH
 	})
 	return start, end
 }
 
 func (cv *Canvas) planTimelines(win *theme.Window, gtx layout.Context, texs []TextureStack) []TextureStack {
+	if pinned := cv.pinnedGCTimeline(); pinned != nil {
+		texs = pinned.Plan(win, texs)
+	}
+
 	start, end := cv.visibleTimelines(gtx)
 
 	cvy := cv.denormalizeY(gtx, cv.y)
 	y := -cvy
-	if start < len(cv.timelines) && start > 0 {
+	tls := cv.scrollTimelines()
+	if start < len(tls) && start > 0 {
 		y = cv.timelineEnds[start-1] - cvy
 	}
 
 	for i := start; i < end; i++ {
-		tl := cv.timelines[i]
+		tl := tls[i]
 		texs = tl.Plan(win, texs)
 		y += tl.Height(gtx, cv)
 	}
@@ -1246,18 +1332,45 @@ func (cv *Canvas) layoutTimelines(win *theme.Window, gtx layout.Context) (layout
 		tl.displayed = false
 	}
 
+	var displayed []*Timeline
+
+	pinnedH := cv.pinnedTimelineHeight(gtx)
+	if pinned := cv.pinnedGCTimeline(); pinned != nil {
+		stack := op.Offset(image.Pt(0, 0)).Push(gtx.Ops)
+		pinned.Layout(win, gtx, cv, cv.timeline.displayAllLabels, cv.timeline.compact, false, &cv.trackSpanLabels)
+		stack.Pop()
+		displayed = append(displayed, pinned)
+
+		if pinned.widget.LabelClicked() {
+			cv.clickedTimelines = append(cv.clickedTimelines, pinned)
+		}
+		if pinned.widget.LabelRightClicked() {
+			cv.rightClickedTimelines = append(cv.rightClickedTimelines, pinned)
+		}
+	}
+
+	// Don't let scrolled timelines draw over the pinned GC timeline.
+	scrollClip := clip.Rect{Min: image.Pt(0, pinnedH), Max: gtx.Constraints.Max}.Push(gtx.Ops)
+	defer scrollClip.Pop()
+
 	start, end := cv.visibleTimelines(gtx)
 
 	cvy := cv.denormalizeY(gtx, cv.y)
-	y := -cvy
-	if start < len(cv.timelines) && start > 0 {
-		y = cv.timelineEnds[start-1] - cvy
+	y := pinnedH - cvy
+	tls := cv.scrollTimelines()
+	if start < len(tls) && start > 0 {
+		y = pinnedH + cv.timelineEnds[start-1] - cvy
 	}
 
 	for i := start; i < end; i++ {
-		tl := cv.timelines[i]
+		tl := tls[i]
 		stack := op.Offset(image.Pt(0, y)).Push(gtx.Ops)
-		topBorder := i > 0 && cv.timelines[i-1].widget.Hovered(gtx)
+		topBorder := false
+		if i > 0 {
+			topBorder = tls[i-1].widget.Hovered(gtx)
+		} else if pinned := cv.pinnedGCTimeline(); pinned != nil {
+			topBorder = pinned.widget.Hovered(gtx)
+		}
 		tl.Layout(win, gtx, cv, cv.timeline.displayAllLabels, cv.timeline.compact, topBorder, &cv.trackSpanLabels)
 		stack.Pop()
 
@@ -1279,7 +1392,8 @@ func (cv *Canvas) layoutTimelines(win *theme.Window, gtx layout.Context) (layout
 		}
 	}
 
-	return layout.Dimensions{Size: gtx.Constraints.Max}, cv.timelines[start:end]
+	displayed = append(displayed, tls[start:end]...)
+	return layout.Dimensions{Size: gtx.Constraints.Max}, displayed
 }
 
 // setPointerPosition updates the canvas's pointer position. This is used by Axis to keep the canvas updated while the
