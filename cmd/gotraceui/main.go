@@ -309,6 +309,7 @@ type Tab struct {
 type MainWindow struct {
 	canvas          Canvas
 	trace           *Trace
+	traceFileName   string
 	explorer        *explorer.Explorer
 	showingExplorer atomic.Bool
 	mainMenu        *MainMenu
@@ -370,10 +371,24 @@ func NewMainWindow() *MainWindow {
 	return &mwin
 }
 
+func (mwin *MainWindow) updateWindowTitle() {
+	title := "gotraceui"
+	if mwin.traceFileName != "" {
+		title = filepath.Base(mwin.traceFileName)
+	}
+	mwin.win.Option(app.Title(title))
+}
+
 // OpenTrace initiates loading of a trace. It changes the state to loadingTrace, loads the trace, and notifies the
 // window when it's done. OpenTrace should be called from a different goroutine than the render loop.
 func (mwin *MainWindow) OpenTrace(r io.Reader) {
 	mwin.SetState("loadingTrace")
+
+	traceName := ""
+	type namer interface{ Name() string }
+	if n, ok := r.(namer); ok {
+		traceName = n.Name()
+	}
 
 	res, err := loadTrace(r, mwin, &mwin.canvas)
 	if memprofileLoad != "" {
@@ -392,6 +407,7 @@ func (mwin *MainWindow) OpenTrace(r io.Reader) {
 		return
 	}
 
+	res.traceName = traceName
 	mwin.LoadTrace(res)
 }
 
@@ -1131,6 +1147,8 @@ func (mwin *MainWindow) loadTraceImpl(res loadTraceResult) {
 	}
 
 	mwin.trace = res.trace
+	mwin.traceFileName = res.traceName
+	mwin.updateWindowTitle()
 	mwin.panel = nil
 	mwin.panelHistory = nil
 	mwin.tabs = mwin.tabs[:1]
@@ -1457,6 +1475,7 @@ type loadTraceResult struct {
 	plot          Plot
 	goroutinePlot Plot
 	timelines     []*Timeline
+	traceName     string
 }
 
 type progresser interface {
