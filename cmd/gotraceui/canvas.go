@@ -124,6 +124,9 @@ type Canvas struct {
 	start   exptrace.Time
 	nsPerPx float64
 
+	// Set to true when the user pans by dragging during the current frame.
+	pannedThisFrame bool
+
 	// The width of the canvas, in pixels, updated on each frame
 	width int
 
@@ -220,6 +223,31 @@ type Canvas struct {
 	trackWidgetsCache    mem.AllocationCache[TrackWidget]
 
 	textures TextureManager
+}
+
+func (cv *Canvas) setViewportFromSync(gtx layout.Context, start exptrace.Time, y normalizedY) {
+	cv.cancelNavigation()
+	cv.start = start
+	cv.y = y
+	if cv.y < 0 {
+		cv.y = 0
+	}
+	// XXX don't allow dragging cv.y beyond end
+}
+
+func (cv *Canvas) applyViewportDeltaFromSync(gtx layout.Context, dStart exptrace.Time, dY normalizedY) {
+	cv.cancelNavigation()
+	cv.start += dStart
+	cv.y += dY
+	if cv.y < 0 {
+		cv.y = 0
+	}
+	// XXX don't allow dragging cv.y beyond end
+}
+
+func (cv *Canvas) applyHorizontalDeltaFromSync(gtx layout.Context, dStart exptrace.Time) {
+	cv.cancelNavigation()
+	cv.start += dStart
 }
 
 func (cv *Canvas) pinnedGCTimeline() *Timeline {
@@ -466,6 +494,7 @@ func (cv *Canvas) dragTo(gtx layout.Context, pos f32.Point) {
 	// easily perceptible.
 	td := time.Duration(math.Round(cv.nsPerPx * math.Round(float64(cv.drag.clickAt.X-pos.X))))
 	cv.start = cv.drag.start + exptrace.Time(td)
+	cv.pannedThisFrame = true
 
 	yd := int(math32.Round(cv.drag.clickAt.Y - pos.Y))
 	cv.y = cv.drag.startY + cv.normalizeY(gtx, yd)
@@ -687,6 +716,8 @@ func (cv *Canvas) scroll(gtx layout.Context, dx, dy float32) {
 
 func (cv *Canvas) Layout(win *theme.Window, gtx layout.Context) layout.Dimensions {
 	defer rtrace.StartRegion(context.Background(), "main.Canvas.Layout").End()
+
+	cv.pannedThisFrame = false
 
 	if win.Frame%compactInterval == 0 {
 		cv.textures.Compact()

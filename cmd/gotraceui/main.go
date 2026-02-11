@@ -314,6 +314,9 @@ type MainWindow struct {
 	showingExplorer atomic.Bool
 	mainMenu        *MainMenu
 
+	syncPanAllTraces bool
+	panSync          *panSyncService
+
 	cpuProfile *os.File
 
 	gc *GCScheduler
@@ -350,10 +353,11 @@ type MainWindow struct {
 func NewMainWindow() *MainWindow {
 	var mwin MainWindow
 	mwin = MainWindow{
-		debugWindow: NewDebugWindow(),
-		errs:        make(chan error),
-		subwindows:  map[Window]struct{}{},
-		gc:          NewGCScheduler(0, 0),
+		debugWindow:      NewDebugWindow(),
+		errs:             make(chan error),
+		subwindows:       map[Window]struct{}{},
+		gc:               NewGCScheduler(0, 0),
+		syncPanAllTraces: true,
 		resize: component.Resize{
 			Axis:  layout.Horizontal,
 			Ratio: 0.70,
@@ -451,6 +455,10 @@ func (mwin *MainWindow) SetProgressStage(idx int) {
 func (mwin *MainWindow) LoadTrace(res loadTraceResult) {
 	mwin.twin.EmitAction(theme.ExecuteAction(func(gtx layout.Context) {
 		mwin.loadTraceImpl(res)
+		if mwin.syncPanAllTraces {
+			// Default is enabled; start the service once the canvas has a baseline.
+			mwin.setPanSyncEnabled(mwin.twin, gtx, true)
+		}
 		mwin.setState("main")
 	}))
 }
@@ -497,6 +505,7 @@ type MainMenu struct {
 		ZoomToFit            theme.MenuItem
 		JumpToBeginning      theme.MenuItem
 		HighlightSpans       theme.MenuItem
+		SyncPanAllTraces     theme.MenuItem
 		ToggleCompactDisplay theme.MenuItem
 		ToggleTimelineLabels theme.MenuItem
 		ToggleStackTracks    theme.MenuItem
@@ -530,6 +539,12 @@ func NewMainMenu(mwin *MainWindow, win *theme.Window) *MainMenu {
 	m.Display.ZoomToFit = theme.MenuItem{Shortcut: key.ModShortcut.String() + "+Home", Label: PlainLabel("Zoom to fit visible timelines"), Disabled: notMainDisabled}
 	m.Display.JumpToBeginning = theme.MenuItem{Shortcut: "Shift+Home", Label: PlainLabel("Jump to beginning of timeline"), Disabled: notMainDisabled}
 	m.Display.HighlightSpans = theme.MenuItem{Shortcut: "H", Label: PlainLabel("Highlight spans…"), Disabled: notMainDisabled}
+	m.Display.SyncPanAllTraces = theme.MenuItem{Label: func() string {
+		if mwin.syncPanAllTraces {
+			return "* Sync pan"
+		}
+		return "Sync pan"
+	}, Disabled: notMainDisabled}
 	m.Display.ToggleCompactDisplay = theme.MenuItem{Shortcut: "C", Label: ToggleLabel("Disable compact display", "Enable compact display", &mwin.canvas.timeline.compact), Disabled: notMainDisabled}
 	m.Display.ToggleTimelineLabels = theme.MenuItem{Shortcut: "X", Label: ToggleLabel("Hide timeline labels", "Show timeline labels", &mwin.canvas.timeline.displayAllLabels), Disabled: notMainDisabled}
 	m.Display.ToggleStackTracks = theme.MenuItem{Shortcut: "S", Label: ToggleLabel("Hide stack frames", "Show stack frames", &mwin.canvas.timeline.displayStackTracks), Disabled: notMainDisabled}
@@ -573,6 +588,10 @@ func NewMainMenu(mwin *MainWindow, win *theme.Window) *MainMenu {
 					theme.MenuDivider(win.Theme).Layout,
 
 					theme.NewMenuItemStyle(win.Theme, &m.Display.HighlightSpans).Layout,
+
+					theme.MenuDivider(win.Theme).Layout,
+
+					theme.NewMenuItemStyle(win.Theme, &m.Display.SyncPanAllTraces).Layout,
 
 					theme.MenuDivider(win.Theme).Layout,
 
@@ -657,6 +676,9 @@ func (mwin *MainWindow) Run() error {
 
 		switch ev := e.(type) {
 		case system.DestroyEvent:
+			if mwin.panSync != nil {
+				mwin.panSync.Stop()
+			}
 			return ev.Err
 		case system.FrameEvent:
 			if measureFrameAllocs {
@@ -704,6 +726,10 @@ func (mwin *MainWindow) Run() error {
 				if mwin.mainMenu.Display.HighlightSpans.Clicked(gtx) {
 					win.Menu.Close()
 					displayHighlightSpansDialog(win, &mwin.canvas.timeline.filter)
+				}
+				if mwin.mainMenu.Display.SyncPanAllTraces.Clicked(gtx) {
+					win.Menu.Close()
+					mwin.setPanSyncEnabled(win, gtx, !mwin.syncPanAllTraces)
 				}
 				if mwin.mainMenu.Display.ToggleCompactDisplay.Clicked(gtx) {
 					win.Menu.Close()
@@ -1108,6 +1134,17 @@ func (mwin *MainWindow) renderMainScene(win *theme.Window, gtx layout.Context, s
 		mwin.openSpan(clicked)
 		// FIXME(dh): canvas does event handling _after_ layout, so we need a second frame
 		op.InvalidateOp{}.Add(gtx.Ops)
+	}
+
+	if mwin.syncPanAllTraces && mwin.panSync != nil {
+		// When sync is enabled before the first frame has initialized the viewport,
+		// set the baseline lazily to avoid a large first delta.
+		if mwin.canvas.nsPerPx != 0 {
+			mwin.panSync.EnsureBaseline(mwin.canvas.start, mwin.canvas.y)
+		}
+		if mwin.canvas.pannedThisFrame {
+			mwin.panSync.Broadcast(mwin.canvas.start, mwin.canvas.y)
+		}
 	}
 
 	return dims
