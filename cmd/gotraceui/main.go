@@ -314,8 +314,9 @@ type MainWindow struct {
 	showingExplorer atomic.Bool
 	mainMenu        *MainMenu
 
-	syncPanAllTraces bool
-	panSync          *panSyncService
+	syncPanAllTraces  bool
+	syncZoomAllTraces bool
+	panSync           *panSyncService
 
 	cpuProfile *os.File
 
@@ -353,11 +354,12 @@ type MainWindow struct {
 func NewMainWindow() *MainWindow {
 	var mwin MainWindow
 	mwin = MainWindow{
-		debugWindow:      NewDebugWindow(),
-		errs:             make(chan error),
-		subwindows:       map[Window]struct{}{},
-		gc:               NewGCScheduler(0, 0),
-		syncPanAllTraces: true,
+		debugWindow:       NewDebugWindow(),
+		errs:              make(chan error),
+		subwindows:        map[Window]struct{}{},
+		gc:                NewGCScheduler(0, 0),
+		syncPanAllTraces:  true,
+		syncZoomAllTraces: true,
 		resize: component.Resize{
 			Axis:  layout.Horizontal,
 			Ratio: 0.70,
@@ -455,9 +457,9 @@ func (mwin *MainWindow) SetProgressStage(idx int) {
 func (mwin *MainWindow) LoadTrace(res loadTraceResult) {
 	mwin.twin.EmitAction(theme.ExecuteAction(func(gtx layout.Context) {
 		mwin.loadTraceImpl(res)
-		if mwin.syncPanAllTraces {
-			// Default is enabled; start the service once the canvas has a baseline.
-			mwin.setPanSyncEnabled(mwin.twin, gtx, true)
+		if mwin.syncPanAllTraces || mwin.syncZoomAllTraces {
+			// Defaults are enabled; start the service once the canvas has a baseline.
+			mwin.updateSyncServiceState(mwin.twin, gtx)
 		}
 		mwin.setState("main")
 	}))
@@ -506,6 +508,7 @@ type MainMenu struct {
 		JumpToBeginning      theme.MenuItem
 		HighlightSpans       theme.MenuItem
 		SyncPanAllTraces     theme.MenuItem
+		SyncZoomAllTraces    theme.MenuItem
 		ToggleCompactDisplay theme.MenuItem
 		ToggleTimelineLabels theme.MenuItem
 		ToggleStackTracks    theme.MenuItem
@@ -544,6 +547,12 @@ func NewMainMenu(mwin *MainWindow, win *theme.Window) *MainMenu {
 			return "* Sync pan"
 		}
 		return "Sync pan"
+	}, Disabled: notMainDisabled}
+	m.Display.SyncZoomAllTraces = theme.MenuItem{Label: func() string {
+		if mwin.syncZoomAllTraces {
+			return "* Sync zoom"
+		}
+		return "Sync zoom"
 	}, Disabled: notMainDisabled}
 	m.Display.ToggleCompactDisplay = theme.MenuItem{Shortcut: "C", Label: ToggleLabel("Disable compact display", "Enable compact display", &mwin.canvas.timeline.compact), Disabled: notMainDisabled}
 	m.Display.ToggleTimelineLabels = theme.MenuItem{Shortcut: "X", Label: ToggleLabel("Hide timeline labels", "Show timeline labels", &mwin.canvas.timeline.displayAllLabels), Disabled: notMainDisabled}
@@ -592,6 +601,7 @@ func NewMainMenu(mwin *MainWindow, win *theme.Window) *MainMenu {
 					theme.MenuDivider(win.Theme).Layout,
 
 					theme.NewMenuItemStyle(win.Theme, &m.Display.SyncPanAllTraces).Layout,
+					theme.NewMenuItemStyle(win.Theme, &m.Display.SyncZoomAllTraces).Layout,
 
 					theme.MenuDivider(win.Theme).Layout,
 
@@ -730,6 +740,10 @@ func (mwin *MainWindow) Run() error {
 				if mwin.mainMenu.Display.SyncPanAllTraces.Clicked(gtx) {
 					win.Menu.Close()
 					mwin.setPanSyncEnabled(win, gtx, !mwin.syncPanAllTraces)
+				}
+				if mwin.mainMenu.Display.SyncZoomAllTraces.Clicked(gtx) {
+					win.Menu.Close()
+					mwin.setZoomSyncEnabled(win, gtx, !mwin.syncZoomAllTraces)
 				}
 				if mwin.mainMenu.Display.ToggleCompactDisplay.Clicked(gtx) {
 					win.Menu.Close()
@@ -1136,14 +1150,17 @@ func (mwin *MainWindow) renderMainScene(win *theme.Window, gtx layout.Context, s
 		op.InvalidateOp{}.Add(gtx.Ops)
 	}
 
-	if mwin.syncPanAllTraces && mwin.panSync != nil {
+	if (mwin.syncPanAllTraces || mwin.syncZoomAllTraces) && mwin.panSync != nil {
 		// When sync is enabled before the first frame has initialized the viewport,
 		// set the baseline lazily to avoid a large first delta.
 		if mwin.canvas.nsPerPx != 0 {
 			mwin.panSync.EnsureBaseline(mwin.canvas.start, mwin.canvas.y)
 		}
-		if mwin.canvas.pannedThisFrame {
-			mwin.panSync.Broadcast(mwin.canvas.start, mwin.canvas.y)
+		if mwin.syncPanAllTraces && mwin.canvas.pannedThisFrame {
+			mwin.panSync.BroadcastPan(mwin.canvas.start, mwin.canvas.y)
+		}
+		if mwin.syncZoomAllTraces && mwin.canvas.zoomedThisFrame {
+			mwin.panSync.BroadcastZoom(mwin.canvas.start, mwin.canvas.nsPerPx)
 		}
 	}
 
