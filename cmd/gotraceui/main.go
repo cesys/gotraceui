@@ -1413,6 +1413,7 @@ func main() {
 	mwin.win = app.NewWindow(app.Title("gotraceui"))
 	mwin.twin = theme.NewWindow(mwin.win)
 	mwin.explorer = explorer.NewExplorer(mwin.win)
+	explorer.DefaultExplorer = mwin.explorer
 
 	if debug {
 		go func() {

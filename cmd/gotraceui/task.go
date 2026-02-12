@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/csv"
 	"fmt"
 	"image"
+	"io"
 	"math"
 	rtrace "runtime/trace"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"honnef.co/go/gotraceui/clip"
@@ -18,6 +23,7 @@ import (
 
 	"gioui.org/font"
 	"gioui.org/text"
+	"gioui.org/x/explorer"
 	exptrace "golang.org/x/exp/trace"
 )
 
@@ -575,8 +581,90 @@ func (gs *TaskList) Layout(win *theme.Window, gtx layout.Context) layout.Dimensi
 	return dims
 }
 
+func (gs *TaskList) toCSV() string {
+	// Export the currently visible columns in the currently active sort order.
+	if gs.table == nil {
+		return ""
+	}
+	gs.Tasks.Reset(gs.Tasks.Items)
+	gs.setTasks(layout.Context{}, gs.Tasks.Items)
+
+	var buf bytes.Buffer
+	w := csv.NewWriter(&buf)
+
+	header := make([]string, 0, len(gs.table.Columns))
+	for _, col := range gs.table.Columns {
+		header = append(header, col.Name)
+	}
+	_ = w.Write(header)
+
+	for i := range gs.Tasks.Len() {
+		t := gs.Tasks.At(i)
+		row := make([]string, 0, len(gs.table.Columns))
+		for _, col := range gs.table.Columns {
+			switch col.Name {
+			case "Task":
+				row = append(row, local.Sprintf("%d", t.ID))
+			case "Name":
+				row = append(row, t.Name)
+			case "Start time":
+				if start, ok := t.Start.Get(); ok {
+					row = append(row, formatTimestamp(nil, gs.Trace.AdjustedTime(start)))
+				} else {
+					row = append(row, "before trace start")
+				}
+			case "End time":
+				if end, ok := t.End.Get(); ok {
+					row = append(row, formatTimestamp(nil, gs.Trace.AdjustedTime(end)))
+				} else {
+					row = append(row, "after trace end")
+				}
+			case "Duration":
+				traceStart := t.EffectiveStart()
+				traceEnd := t.EffectiveEnd()
+
+				start, sok := t.Start.Get()
+				end, eok := t.End.Get()
+
+				var d time.Duration
+				var approx bool
+				if !sok && !eok {
+					d = time.Duration(traceEnd - traceStart)
+					approx = true
+				} else if !sok {
+					d = time.Duration(end - traceStart)
+					approx = true
+				} else if !eok {
+					d = time.Duration(traceEnd - start)
+					approx = true
+				} else {
+					d = time.Duration(end - start)
+				}
+
+				value, unit := durationNumberFormatSITable.format(d)
+				if approx {
+					value = "≥ " + value
+				}
+				row = append(row, fmt.Sprintf("%s %s", value, unit))
+			default:
+				row = append(row, "")
+			}
+		}
+		_ = w.Write(row)
+	}
+
+	w.Flush()
+	return buf.String()
+}
+
 type TasksComponent struct {
 	list TaskList
+
+	downloadCSV widget.PrimaryClickable
+	exporting   atomic.Bool
+
+	notifMu sync.Mutex
+	notif   string
 }
 
 func NewTasksComponent(tasks []*ptrace.Task, tr *Trace) *TasksComponent {
@@ -603,5 +691,89 @@ func (*TasksComponent) WantsTransition(gtx layout.Context) theme.ComponentState 
 
 // Layout implements theme.Component.
 func (gc *TasksComponent) Layout(win *theme.Window, gtx layout.Context) layout.Dimensions {
-	return gc.list.Layout(win, gtx)
+	gc.list.initTable(win, gtx)
+	gc.list.Update(gtx)
+
+	gc.notifMu.Lock()
+	msg := gc.notif
+	gc.notif = ""
+	gc.notifMu.Unlock()
+	if msg != "" {
+		win.ShowNotification(gtx, msg)
+	}
+
+	for gc.downloadCSV.Clicked(gtx) {
+		if gc.exporting.CompareAndSwap(false, true) {
+			appWin := win.AppWindow
+			csvText := gc.list.toCSV()
+			go func() {
+				defer gc.exporting.Store(false)
+
+				exp := explorer.DefaultExplorer
+				if exp == nil {
+					gc.notifMu.Lock()
+					gc.notif = "File export isn't available on this system."
+					gc.notifMu.Unlock()
+					appWin.Invalidate()
+					return
+				}
+
+				wc, err := exp.CreateFile("tasks.csv")
+				if err != nil {
+					switch err {
+					case explorer.ErrUserDecline:
+						// No-op.
+					case explorer.ErrNotAvailable:
+						gc.notifMu.Lock()
+						gc.notif = "File export isn't available on this system."
+						gc.notifMu.Unlock()
+					default:
+						gc.notifMu.Lock()
+						gc.notif = local.Sprintf("Couldn't export CSV: %s", err)
+						gc.notifMu.Unlock()
+					}
+					appWin.Invalidate()
+					return
+				}
+
+				_, writeErr := io.WriteString(wc, csvText)
+				closeErr := wc.Close()
+
+				if writeErr != nil {
+					gc.notifMu.Lock()
+					gc.notif = local.Sprintf("Couldn't export CSV: %s", writeErr)
+					gc.notifMu.Unlock()
+				} else if closeErr != nil {
+					gc.notifMu.Lock()
+					gc.notif = local.Sprintf("Couldn't export CSV: %s", closeErr)
+					gc.notifMu.Unlock()
+				} else if f, ok := wc.(interface{ Name() string }); ok && f.Name() != "" {
+					gc.notifMu.Lock()
+					gc.notif = local.Sprintf("Wrote CSV to %s", f.Name())
+					gc.notifMu.Unlock()
+				} else {
+					gc.notifMu.Lock()
+					gc.notif = "Wrote CSV."
+					gc.notifMu.Unlock()
+				}
+
+				appWin.Invalidate()
+			}()
+		}
+	}
+
+	return layout.Rigids(gtx, layout.Vertical,
+		func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions { return layout.Dimensions{} }),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return theme.Button(win.Theme, &gc.downloadCSV.Clickable, "Download CSV").Layout(win, gtx)
+				}),
+			)
+		},
+		func(gtx layout.Context) layout.Dimensions { return layout.Spacer{Height: 10}.Layout(gtx) },
+		func(gtx layout.Context) layout.Dimensions {
+			return gc.list.Layout(win, gtx)
+		},
+	)
 }
