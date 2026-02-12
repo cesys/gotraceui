@@ -27,9 +27,11 @@ type panSyncInstanceFile struct {
 }
 
 type panSyncMessage struct {
-	Sender string  `json:"sender"`
-	DStart int64   `json:"d_start"`
-	DY     float64 `json:"d_y"`
+	Sender  string  `json:"sender"`
+	Kind    string  `json:"kind"` // "pan" or "zoom"
+	DStart  int64   `json:"d_start,omitempty"`
+	Start   int64   `json:"start,omitempty"`
+	NsPerPx float64 `json:"ns_per_px,omitempty"`
 }
 
 type panSyncPeer struct {
@@ -72,7 +74,11 @@ func newPanSyncService() (*panSyncService, error) {
 	}, nil
 }
 
-func (s *panSyncService) Start(onDelta func(dStart exptrace.Time, dY normalizedY), invalidate func()) error {
+func (s *panSyncService) Start(
+	onPan func(dStart exptrace.Time),
+	onZoom func(start exptrace.Time, nsPerPx float64),
+	invalidate func(),
+) error {
 	if err := os.MkdirAll(s.regDir, 0o755); err != nil {
 		return err
 	}
@@ -100,7 +106,7 @@ func (s *panSyncService) Start(onDelta func(dStart exptrace.Time, dY normalizedY
 		return err
 	}
 
-	go s.recvLoop(onDelta, invalidate)
+	go s.recvLoop(onPan, onZoom, invalidate)
 	return nil
 }
 
@@ -135,7 +141,7 @@ func (s *panSyncService) EnsureBaseline(start exptrace.Time, y normalizedY) {
 	s.last.y = y
 }
 
-func (s *panSyncService) Broadcast(start exptrace.Time, y normalizedY) {
+func (s *panSyncService) BroadcastPan(start exptrace.Time, y normalizedY) {
 	if s.conn == nil {
 		return
 	}
@@ -149,7 +155,6 @@ func (s *panSyncService) Broadcast(start exptrace.Time, y normalizedY) {
 	}
 
 	ds := start - s.last.start
-	dy := y - s.last.y
 	if ds == 0 {
 		return
 	}
@@ -157,7 +162,32 @@ func (s *panSyncService) Broadcast(start exptrace.Time, y normalizedY) {
 	s.last.start = start
 	s.last.y = y
 
-	msg := panSyncMessage{Sender: s.id, DStart: int64(ds), DY: float64(dy)}
+	msg := panSyncMessage{Sender: s.id, Kind: "pan", DStart: int64(ds)}
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+
+	peers := s.getPeers()
+	for _, p := range peers {
+		if p.id == s.id {
+			continue
+		}
+		_, _ = s.conn.WriteToUDP(b, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: p.port})
+	}
+}
+
+func (s *panSyncService) BroadcastZoom(start exptrace.Time, nsPerPx float64) {
+	if s.conn == nil || nsPerPx == 0 {
+		return
+	}
+
+	// Reset the pan baseline on zoom so the next pan only contains pan movement,
+	// not the accumulated pre-zoom -> post-zoom jump in start timestamp.
+	s.last.set = true
+	s.last.start = start
+
+	msg := panSyncMessage{Sender: s.id, Kind: "zoom", Start: int64(start), NsPerPx: nsPerPx}
 	b, err := json.Marshal(msg)
 	if err != nil {
 		return
@@ -213,7 +243,11 @@ func (s *panSyncService) getPeers() []panSyncPeer {
 	return append([]panSyncPeer(nil), s.peers...)
 }
 
-func (s *panSyncService) recvLoop(onDelta func(dStart exptrace.Time, dY normalizedY), invalidate func()) {
+func (s *panSyncService) recvLoop(
+	onPan func(dStart exptrace.Time),
+	onZoom func(start exptrace.Time, nsPerPx float64),
+	invalidate func(),
+) {
 	buf := make([]byte, 1024)
 	for {
 		_ = s.conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
@@ -245,31 +279,33 @@ func (s *panSyncService) recvLoop(onDelta func(dStart exptrace.Time, dY normaliz
 			continue
 		}
 
-		onDelta(exptrace.Time(msg.DStart), normalizedY(msg.DY))
+		switch msg.Kind {
+		case "zoom":
+			if msg.NsPerPx == 0 {
+				continue
+			}
+			onZoom(exptrace.Time(msg.Start), msg.NsPerPx)
+		case "pan", "":
+			onPan(exptrace.Time(msg.DStart))
+		default:
+			continue
+		}
 		invalidate()
 	}
 }
 
-func (mwin *MainWindow) setPanSyncEnabled(win *theme.Window, gtx layout.Context, enabled bool) {
-	mwin.syncPanAllTraces = enabled
-	if !enabled {
-		if mwin.panSync != nil {
-			mwin.panSync.Stop()
-			mwin.panSync = nil
-		}
-		win.ShowNotification(gtx, "Sync pan disabled")
-		return
-	}
+func (mwin *MainWindow) syncEnabled() bool {
+	return mwin.syncPanAllTraces || mwin.syncZoomAllTraces
+}
 
+func (mwin *MainWindow) ensureSyncService(win *theme.Window, gtx layout.Context) {
 	if mwin.panSync != nil {
-		mwin.panSync.SetBaseline(mwin.canvas.start, mwin.canvas.y)
 		return
 	}
 
 	svc, err := newPanSyncService()
 	if err != nil {
-		win.ShowNotification(gtx, fmt.Sprintf("Couldn't enable sync pan: %s", err))
-		mwin.syncPanAllTraces = false
+		win.ShowNotification(gtx, fmt.Sprintf("Couldn't enable sync: %s", err))
 		return
 	}
 
@@ -277,20 +313,68 @@ func (mwin *MainWindow) setPanSyncEnabled(win *theme.Window, gtx layout.Context,
 		svc.SetBaseline(mwin.canvas.start, mwin.canvas.y)
 	}
 
-	onDelta := func(dStart exptrace.Time, _ normalizedY) {
+	onPan := func(dStart exptrace.Time) {
+		if !mwin.syncPanAllTraces {
+			return
+		}
 		mwin.twin.EmitAction(theme.ExecuteAction(func(gtx layout.Context) {
 			mwin.canvas.applyHorizontalDeltaFromSync(gtx, dStart)
+		}))
+	}
+	onZoom := func(start exptrace.Time, nsPerPx float64) {
+		if !mwin.syncZoomAllTraces {
+			return
+		}
+		mwin.twin.EmitAction(theme.ExecuteAction(func(gtx layout.Context) {
+			mwin.canvas.applyZoomFromSync(gtx, start, nsPerPx)
+			if mwin.panSync != nil {
+				// Keep pan baseline aligned with the synced zoomed viewport.
+				mwin.panSync.SetBaseline(mwin.canvas.start, mwin.canvas.y)
+			}
 		}))
 	}
 	invalidate := func() {
 		mwin.twin.AppWindow.Invalidate()
 	}
 
-	if err := svc.Start(onDelta, invalidate); err != nil {
-		win.ShowNotification(gtx, fmt.Sprintf("Couldn't enable sync pan: %s", err))
-		mwin.syncPanAllTraces = false
+	if err := svc.Start(onPan, onZoom, invalidate); err != nil {
+		win.ShowNotification(gtx, fmt.Sprintf("Couldn't enable sync: %s", err))
 		return
 	}
 	mwin.panSync = svc
-	win.ShowNotification(gtx, "Sync pan enabled")
+}
+
+func (mwin *MainWindow) updateSyncServiceState(win *theme.Window, gtx layout.Context) {
+	if mwin.syncEnabled() {
+		mwin.ensureSyncService(win, gtx)
+		if mwin.panSync != nil && mwin.canvas.nsPerPx != 0 {
+			mwin.panSync.SetBaseline(mwin.canvas.start, mwin.canvas.y)
+		}
+		return
+	}
+
+	if mwin.panSync != nil {
+		mwin.panSync.Stop()
+		mwin.panSync = nil
+	}
+}
+
+func (mwin *MainWindow) setPanSyncEnabled(win *theme.Window, gtx layout.Context, enabled bool) {
+	mwin.syncPanAllTraces = enabled
+	mwin.updateSyncServiceState(win, gtx)
+	if enabled {
+		win.ShowNotification(gtx, "Sync pan enabled")
+	} else {
+		win.ShowNotification(gtx, "Sync pan disabled")
+	}
+}
+
+func (mwin *MainWindow) setZoomSyncEnabled(win *theme.Window, gtx layout.Context, enabled bool) {
+	mwin.syncZoomAllTraces = enabled
+	mwin.updateSyncServiceState(win, gtx)
+	if enabled {
+		win.ShowNotification(gtx, "Sync zoom enabled")
+	} else {
+		win.ShowNotification(gtx, "Sync zoom disabled")
+	}
 }

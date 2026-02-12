@@ -126,6 +126,8 @@ type Canvas struct {
 
 	// Set to true when the user pans by dragging during the current frame.
 	pannedThisFrame bool
+	// Set to true when the user zooms during the current frame.
+	zoomedThisFrame bool
 
 	// The width of the canvas, in pixels, updated on each frame
 	width int
@@ -248,6 +250,15 @@ func (cv *Canvas) applyViewportDeltaFromSync(gtx layout.Context, dStart exptrace
 func (cv *Canvas) applyHorizontalDeltaFromSync(gtx layout.Context, dStart exptrace.Time) {
 	cv.cancelNavigation()
 	cv.start += dStart
+}
+
+func (cv *Canvas) applyZoomFromSync(gtx layout.Context, start exptrace.Time, nsPerPx float64) {
+	if nsPerPx == 0 {
+		return
+	}
+	cv.cancelNavigation()
+	cv.start = start
+	cv.nsPerPx = nsPerPx
 }
 
 func (cv *Canvas) pinnedGCTimeline() *Timeline {
@@ -527,6 +538,7 @@ func (cv *Canvas) zoom(ticks float64, at f32.Point) {
 	new = min(new, maxNsPerPx)
 	cv.nsPerPx = new
 	cv.start = ts - exptrace.Time(math.Round(float64(at.X)*new))
+	cv.zoomedThisFrame = true
 }
 
 func (cv *Canvas) visibleSpans(spans Items[ptrace.Span]) Items[ptrace.Span] {
@@ -718,6 +730,7 @@ func (cv *Canvas) Layout(win *theme.Window, gtx layout.Context) layout.Dimension
 	defer rtrace.StartRegion(context.Background(), "main.Canvas.Layout").End()
 
 	cv.pannedThisFrame = false
+	cv.zoomedThisFrame = false
 
 	if win.Frame%compactInterval == 0 {
 		cv.textures.Compact()
