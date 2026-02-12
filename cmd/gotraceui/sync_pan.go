@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"honnef.co/go/gotraceui/layout"
@@ -28,6 +29,7 @@ type panSyncInstanceFile struct {
 
 type panSyncMessage struct {
 	Sender  string  `json:"sender"`
+	Seq     uint64  `json:"seq,omitempty"`
 	Kind    string  `json:"kind"` // "pan" or "zoom"
 	DStart  int64   `json:"d_start,omitempty"`
 	Start   int64   `json:"start,omitempty"`
@@ -50,6 +52,8 @@ type panSyncService struct {
 	mu            sync.Mutex
 	peers         []panSyncPeer
 	peersLastScan time.Time
+	nextSeq       atomic.Uint64
+	recvSeq       map[string]uint64
 
 	last struct {
 		set   bool
@@ -68,10 +72,31 @@ func newPanSyncService() (*panSyncService, error) {
 	id := hex.EncodeToString(b[:])
 	regDir := filepath.Join(os.TempDir(), "gotraceui-sync-pan")
 	return &panSyncService{
-		id:     id,
-		regDir: regDir,
-		stop:   make(chan struct{}),
+		id:      id,
+		regDir:  regDir,
+		recvSeq: make(map[string]uint64),
+		stop:    make(chan struct{}),
 	}, nil
+}
+
+func (s *panSyncService) nextMessageSeq() uint64 {
+	return s.nextSeq.Add(1)
+}
+
+func (s *panSyncService) shouldAcceptMessage(msg panSyncMessage) bool {
+	// Backward compatibility with senders that don't populate Seq.
+	if msg.Seq == 0 {
+		return true
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	last := s.recvSeq[msg.Sender]
+	if msg.Seq <= last {
+		return false
+	}
+	s.recvSeq[msg.Sender] = msg.Seq
+	return true
 }
 
 func (s *panSyncService) Start(
@@ -163,6 +188,7 @@ func (s *panSyncService) BroadcastPan(start exptrace.Time, y normalizedY) {
 	s.last.y = y
 
 	msg := panSyncMessage{Sender: s.id, Kind: "pan", DStart: int64(ds)}
+	msg.Seq = s.nextMessageSeq()
 	b, err := json.Marshal(msg)
 	if err != nil {
 		return
@@ -188,6 +214,7 @@ func (s *panSyncService) BroadcastZoom(start exptrace.Time, nsPerPx float64) {
 	s.last.start = start
 
 	msg := panSyncMessage{Sender: s.id, Kind: "zoom", Start: int64(start), NsPerPx: nsPerPx}
+	msg.Seq = s.nextMessageSeq()
 	b, err := json.Marshal(msg)
 	if err != nil {
 		return
@@ -278,6 +305,9 @@ func (s *panSyncService) recvLoop(
 		if msg.Sender == "" || msg.Sender == s.id {
 			continue
 		}
+		if !s.shouldAcceptMessage(msg) {
+			continue
+		}
 
 		switch msg.Kind {
 		case "zoom":
@@ -319,6 +349,10 @@ func (mwin *MainWindow) ensureSyncService(win *theme.Window, gtx layout.Context)
 		}
 		mwin.twin.EmitAction(theme.ExecuteAction(func(gtx layout.Context) {
 			mwin.canvas.applyHorizontalDeltaFromSync(gtx, dStart)
+			if mwin.panSync != nil {
+				// Keep local outgoing baseline aligned with remotely-applied pans.
+				mwin.panSync.SetBaseline(mwin.canvas.start, mwin.canvas.y)
+			}
 		}))
 	}
 	onZoom := func(start exptrace.Time, nsPerPx float64) {
