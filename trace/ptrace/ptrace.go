@@ -658,15 +658,33 @@ func processEvents(r *exptrace.Reader, tr *Trace, progress func(float64)) error 
 			case rangeScopeUnknown:
 				continue
 			case rangeScopeGC:
+				// We can see a range end without a prior begin if the two occurred in different traces.
+				if len(tr.GC) == 0 {
+					continue
+				}
 				prev = &tr.GC[len(tr.GC)-1]
 			case rangeScopeSTW:
+				// We can see a range end without a prior begin if the two occurred in different traces.
+				if len(tr.STW) == 0 {
+					continue
+				}
 				prev = &tr.STW[len(tr.STW)-1]
 			case rangeScopeGoroutine:
 				g := getG(r.Scope.Goroutine())
-				prev = &g.Ranges[r.Name][len(g.Ranges[r.Name])-1]
+				// We can see a range end without a prior begin if the two occurred in different traces.
+				ss := g.Ranges[r.Name]
+				if len(ss) == 0 {
+					continue
+				}
+				prev = &ss[len(ss)-1]
 			case rangeScopeProc:
 				p := getP(r.Scope.Proc())
-				prev = &p.Ranges[r.Name][len(p.Ranges[r.Name])-1]
+				// We can see a range end without a prior begin if the two occurred in different traces.
+				ss := p.Ranges[r.Name]
+				if len(ss) == 0 {
+					continue
+				}
+				prev = &ss[len(ss)-1]
 			case rangeScopeThread:
 				// XXX implement
 			case rangeScopeGlobal:
