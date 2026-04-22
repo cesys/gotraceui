@@ -22,6 +22,7 @@ import (
 	"honnef.co/go/gotraceui/widget"
 
 	"gioui.org/font"
+	"gioui.org/io/key"
 	"gioui.org/text"
 	"gioui.org/x/explorer"
 	exptrace "golang.org/x/exp/trace"
@@ -713,10 +714,21 @@ func (*TasksComponent) WantsTransition(gtx layout.Context) theme.ComponentState 
 	return theme.ComponentStateNone
 }
 
+// filterEditorKeyset captures letter keys so they don't bubble up and trigger single-key shortcuts.
+var filterEditorKeyset = key.Set("A|B|C|D|E|F|G|H|I|J|K|L|M|N|O|P|Q|R|S|T|U|V|W|X|Y|Z")
+
 // Layout implements theme.Component.
 func (gc *TasksComponent) Layout(win *theme.Window, gtx layout.Context) layout.Dimensions {
 	gc.list.initTable(win, gtx)
 	gc.list.Update(gtx)
+
+	// Swallow key events when the filter editor is focused so they don't trigger shortcuts.
+	if gc.filterEditor.Focused() {
+		key.InputOp{Tag: &gc.filterEditor, Keys: filterEditorKeyset}.Add(gtx.Ops)
+	}
+	// Drain the captured key events.
+	for range gtx.Events(&gc.filterEditor) {
+	}
 
 	// Handle filter editor events.
 	for _, ev := range gc.filterEditor.Events() {
