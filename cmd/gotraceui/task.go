@@ -658,7 +658,11 @@ func (gs *TaskList) toCSV() string {
 }
 
 type TasksComponent struct {
-	list TaskList
+	list     TaskList
+	allTasks []*ptrace.Task
+
+	filterEditor widget.Editor
+	filterText   string
 
 	downloadCSV widget.PrimaryClickable
 	exporting   atomic.Bool
@@ -668,12 +672,32 @@ type TasksComponent struct {
 }
 
 func NewTasksComponent(tasks []*ptrace.Task, tr *Trace) *TasksComponent {
-	return &TasksComponent{
+	tc := &TasksComponent{
 		list: TaskList{
 			Trace: tr,
 			Tasks: NewSortedIndices(tasks),
 		},
+		allTasks: tasks,
 	}
+	tc.filterEditor.SingleLine = true
+	return tc
+}
+
+func (gc *TasksComponent) applyFilter() {
+	text := strings.ToLower(gc.filterText)
+	if text == "" {
+		gc.list.Tasks.Reset(gc.allTasks)
+		gc.list.setTasks(layout.Context{}, gc.list.Tasks.Items)
+		return
+	}
+	filtered := make([]*ptrace.Task, 0, len(gc.allTasks))
+	for _, t := range gc.allTasks {
+		if strings.Contains(strings.ToLower(t.Name), text) {
+			filtered = append(filtered, t)
+		}
+	}
+	gc.list.Tasks.Reset(filtered)
+	gc.list.setTasks(layout.Context{}, gc.list.Tasks.Items)
 }
 
 // Title implements theme.Component.
@@ -693,6 +717,14 @@ func (*TasksComponent) WantsTransition(gtx layout.Context) theme.ComponentState 
 func (gc *TasksComponent) Layout(win *theme.Window, gtx layout.Context) layout.Dimensions {
 	gc.list.initTable(win, gtx)
 	gc.list.Update(gtx)
+
+	// Handle filter editor events.
+	for _, ev := range gc.filterEditor.Events() {
+		if _, ok := ev.(widget.ChangeEvent); ok {
+			gc.filterText = gc.filterEditor.Text()
+			gc.applyFilter()
+		}
+	}
 
 	gc.notifMu.Lock()
 	msg := gc.notif
@@ -764,8 +796,24 @@ func (gc *TasksComponent) Layout(win *theme.Window, gtx layout.Context) layout.D
 
 	return layout.Rigids(gtx, layout.Vertical,
 		func(gtx layout.Context) layout.Dimensions {
-			return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
-				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions { return layout.Dimensions{} }),
+			gtx.Constraints.Min.X = gtx.Constraints.Max.X
+			return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Spacing: layout.SpaceBetween}.Layout(gtx,
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							gtx.Constraints.Max.X = gtx.Dp(250)
+							gtx.Constraints.Min.X = gtx.Dp(250)
+							return theme.TextBox(win.Theme, &gc.filterEditor, "Filter by name…").Layout(win, gtx)
+						}),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return layout.Spacer{Width: 8}.Layout(gtx)
+						}),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							label := local.Sprintf("%d / %d tasks", gc.list.Tasks.Len(), len(gc.allTasks))
+							return widget.Label{MaxLines: 1}.Layout(gtx, win.Theme.Shaper, font.Font{}, 12, label, win.ColorMaterial(gtx, win.Theme.Palette.Foreground))
+						}),
+					)
+				}),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return theme.Button(win.Theme, &gc.downloadCSV.Clickable, "Download CSV").Layout(win, gtx)
 				}),
