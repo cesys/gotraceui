@@ -827,7 +827,9 @@ func (gc *TasksComponent) Layout(win *theme.Window, gtx layout.Context) layout.D
 					)
 				}),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return theme.Button(win.Theme, &gc.downloadCSV.Clickable, "Download CSV").Layout(win, gtx)
+					return layout.Inset{Right: 5}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						return theme.Button(win.Theme, &gc.downloadCSV.Clickable, "Download CSV").Layout(win, gtx)
+					})
 				}),
 			)
 		},
