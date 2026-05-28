@@ -112,6 +112,8 @@ var (
 	exitAfterParsing   bool
 	measureFrameAllocs bool
 	invalidateFrames   bool
+	focusTaskID        exptrace.TaskID
+	focusTaskSet       bool
 )
 
 func (mwin *MainWindow) openGoroutine(g *ptrace.Goroutine) {
@@ -328,6 +330,11 @@ type MainWindow struct {
 	panel        Panel
 	panelHistory []Panel
 
+	// pendingFocusTask is set when a task is requested via the -task flag.
+	// The zoom is applied from renderMainScene once the canvas has been laid
+	// out (so cv.width is non-zero).
+	pendingFocusTask *ptrace.Task
+
 	tabs        []Tab
 	tabbedState theme.TabbedState
 
@@ -462,7 +469,30 @@ func (mwin *MainWindow) LoadTrace(res loadTraceResult) {
 			mwin.updateSyncServiceState(mwin.twin, gtx)
 		}
 		mwin.setState("main")
+		if focusTaskSet {
+			mwin.queueFocusTask(focusTaskID)
+		}
 	}))
+}
+
+// queueFocusTask looks up the task by ID, opens its details panel
+// immediately, and schedules a canvas zoom to run once the canvas has been
+// laid out (cv.width is set during Canvas.Layout, which has not happened
+// yet at trace-load time). The zoom is applied in renderMainScene.
+func (mwin *MainWindow) queueFocusTask(id exptrace.TaskID) {
+	var t *ptrace.Task
+	for _, c := range mwin.trace.Tasks {
+		if c.ID == id {
+			t = c
+			break
+		}
+	}
+	if t == nil {
+		fmt.Fprintf(os.Stderr, "gotraceui: task %d not found in trace\n", id)
+		return
+	}
+	mwin.openTask(t)
+	mwin.pendingFocusTask = t
 }
 
 func (mwin *MainWindow) openLink(gtx layout.Context, l theme.Action) {
@@ -1100,6 +1130,22 @@ func (mwin *MainWindow) renderMainScene(win *theme.Window, gtx layout.Context, s
 
 	dims = theme.Resize(win.Theme, &mwin.resize).Layout(win, gtx, mainArea, panelArea)
 
+	// Apply a pending -task focus once the canvas has been laid out at least
+	// once, so that cv.width and cv.nsPerPx have valid values.
+	if mwin.pendingFocusTask != nil && mwin.canvas.width != 0 && mwin.canvas.nsPerPx != 0 {
+		t := mwin.pendingFocusTask
+		mwin.pendingFocusTask = nil
+		for _, tl := range mwin.canvas.timelines {
+			if tl.item == t {
+				tr := tl.tracks[0]
+				y := mwin.canvas.timelineY(gtx, tl)
+				mwin.canvas.navigateToStartAndEnd(gtx, tr.Start, tr.End, y)
+				break
+			}
+		}
+		op.InvalidateOp{}.Add(gtx.Ops)
+	}
+
 	func() {
 		// Display a dancing gopher while we're computing textures or unpacking stack tracks.
 		gtx := gtx
@@ -1452,6 +1498,15 @@ func main() {
 	flag.BoolVar(&invalidateFrames, "debug.invalidate-frames", false, "Invalidate frame after drawing it")
 	fv := flag.Bool("version", false, "Print version and exit")
 	fdv := flag.Bool("debug.version", false, "Print extended version information and exit")
+	flag.Func("task", "Zoom to the given task ID and open its details panel", func(s string) error {
+		id, err := strconv.ParseUint(s, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid task ID %q: %w", s, err)
+		}
+		focusTaskID = exptrace.TaskID(id)
+		focusTaskSet = true
+		return nil
+	})
 	flag.Parse()
 
 	if *fv {
