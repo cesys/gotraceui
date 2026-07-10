@@ -684,6 +684,24 @@ func NewTasksComponent(tasks []*ptrace.Task, tr *Trace) *TasksComponent {
 	return tc
 }
 
+// taskIDFilterQuery returns the digit-only form of s when s looks like a task ID
+// query (digits with optional thousand separators), otherwise ok is false.
+func taskIDFilterQuery(s string) (id string, ok bool) {
+	var digits strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+			digits.WriteRune(r)
+		case r == ',' || r == ' ' || r == '.' || r == '\'':
+			// Allow common thousand separators so values copied from the table match.
+		default:
+			return "", false
+		}
+	}
+	id = digits.String()
+	return id, id != ""
+}
+
 func (gc *TasksComponent) applyFilter() {
 	text := strings.ToLower(gc.filterText)
 	if text == "" {
@@ -691,9 +709,14 @@ func (gc *TasksComponent) applyFilter() {
 		gc.list.setTasks(layout.Context{}, gc.list.Tasks.Items)
 		return
 	}
+	idQuery, filterByID := taskIDFilterQuery(gc.filterText)
 	filtered := make([]*ptrace.Task, 0, len(gc.allTasks))
 	for _, t := range gc.allTasks {
 		if strings.Contains(strings.ToLower(t.Name), text) {
+			filtered = append(filtered, t)
+			continue
+		}
+		if filterByID && strings.Contains(fmt.Sprintf("%d", t.ID), idQuery) {
 			filtered = append(filtered, t)
 		}
 	}
@@ -815,7 +838,7 @@ func (gc *TasksComponent) Layout(win *theme.Window, gtx layout.Context) layout.D
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 							gtx.Constraints.Max.X = gtx.Dp(250)
 							gtx.Constraints.Min.X = gtx.Dp(250)
-							return theme.TextBox(win.Theme, &gc.filterEditor, "Filter by name…").Layout(win, gtx)
+							return theme.TextBox(win.Theme, &gc.filterEditor, "Filter by name or ID…").Layout(win, gtx)
 						}),
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 							return layout.Spacer{Width: 8}.Layout(gtx)
