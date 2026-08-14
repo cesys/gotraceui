@@ -1,18 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/csv"
 	"fmt"
 	"image"
 	rtrace "runtime/trace"
 	"sort"
 
+	"honnef.co/go/gotraceui/gesture"
 	"honnef.co/go/gotraceui/layout"
 	"honnef.co/go/gotraceui/mem"
 	"honnef.co/go/gotraceui/theme"
 	"honnef.co/go/gotraceui/trace/ptrace"
 	"honnef.co/go/gotraceui/widget"
 
+	"gioui.org/io/pointer"
 	"gioui.org/op/clip"
 	"gioui.org/text"
 	"gioui.org/x/outlay"
@@ -33,6 +37,12 @@ type EventList struct {
 
 	table       theme.Table
 	scrollState theme.YScrollableListState
+
+	copyAsCSV widget.PrimaryClickable
+	// rowClicks holds one click gesture per (filtered) row, used to open a
+	// right-click context menu for copying that event's values. It is indexed
+	// by the row index passed to the table's cell function.
+	rowClicks mem.BucketSlice[gesture.Click]
 
 	timestampObjects mem.BucketSlice[exptrace.Time]
 	texts            mem.BucketSlice[Text]
@@ -144,6 +154,87 @@ func (evs *EventList) eventMessage(ev *exptrace.Event) []string {
 	}
 }
 
+// messageString returns the event's message as a single plain-text string,
+// matching what the "Message" column renders in Layout. It is used for copying
+// event values to the clipboard.
+func (evs *EventList) messageString(ev *exptrace.Event) string {
+	switch ev.Kind() {
+	case exptrace.EventStateTransition:
+		trans := ev.StateTransition()
+		from, to := trans.Goroutine()
+		if from == exptrace.GoNotExist && to == exptrace.GoRunnable {
+			return local.Sprintf("Created goroutine %d", trans.Resource.Goroutine())
+		} else if from == exptrace.GoWaiting && to == exptrace.GoRunnable {
+			return local.Sprintf("Unblocked goroutine %d", trans.Resource.Goroutine())
+		} else if to == exptrace.GoSyscall {
+			stk := ev.Stack()
+			if stk != exptrace.NoStack {
+				frame := evs.Trace.PCs[evs.Trace.Stacks[stk][0]]
+				return fmt.Sprintf("Syscall (%s)", frame.Func)
+			}
+			return "Syscall"
+		}
+		panic(fmt.Sprintf("unexpected state transition %s -> %s", from, to))
+	case exptrace.EventLog:
+		l := ev.Log()
+		if l.Category != "" {
+			return fmt.Sprintf("<%s> %s", l.Category, l.Message)
+		}
+		return l.Message
+	case exptrace.EventTaskBegin:
+		return local.Sprintf("Created task %d (%s)", ev.Task().ID, ev.Task().Type)
+	case exptrace.EventTaskEnd:
+		return local.Sprintf("Subtask ended: task %d (%s)", ev.Task().ID, ev.Task().Type)
+	default:
+		panic(fmt.Sprintf("unhandled kind %v", ev.Kind()))
+	}
+}
+
+func (evs *EventList) timestampString(ev *exptrace.Event) string {
+	return formatTimestamp(nil, evs.Trace.AdjustedTime(ev.Time()))
+}
+
+// toCSV serializes all currently visible events to CSV, matching the displayed
+// Time and Message columns.
+func (evs *EventList) toCSV() string {
+	var buf bytes.Buffer
+	w := csv.NewWriter(&buf)
+	w.Write([]string{"Time", "Message"})
+	for i := range evs.filteredEvents.Len() {
+		ev := evs.Trace.Event(evs.filteredEvents.At(i))
+		w.Write([]string{evs.timestampString(ev), evs.messageString(ev)})
+	}
+	w.Flush()
+	return buf.String()
+}
+
+// setRowContextMenu opens a context menu offering to copy the given event's
+// message or its whole row (time and message) to the clipboard.
+func (evs *EventList) setRowContextMenu(win *theme.Window, evID ptrace.EventID) {
+	ev := evs.Trace.Event(evID)
+	msg := evs.messageString(ev)
+	row := evs.timestampString(ev) + "\t" + msg
+	appWin := win.AppWindow
+	win.SetContextMenu([]*theme.MenuItem{
+		{
+			Label: PlainLabel("Copy message"),
+			Action: func() theme.Action {
+				return theme.ExecuteAction(func(gtx layout.Context) {
+					appWin.WriteClipboard(msg)
+				})
+			},
+		},
+		{
+			Label: PlainLabel("Copy row"),
+			Action: func() theme.Action {
+				return theme.ExecuteAction(func(gtx layout.Context) {
+					appWin.WriteClipboard(row)
+				})
+			},
+		},
+	})
+}
+
 func (evs *EventList) sort() {
 	evs.filteredEvents.Sort(func(ap, bp *ptrace.EventID) int {
 		a, b := *ap, *bp
@@ -231,12 +322,33 @@ func (evs *EventList) Layout(win *theme.Window, gtx layout.Context) layout.Dimen
 
 	evs.Update(gtx)
 
+	for evs.copyAsCSV.Clicked(gtx) {
+		win.AppWindow.WriteClipboard(evs.toCSV())
+	}
+
+	// Make sure we have one click gesture per visible row, then process any
+	// right-clicks reported since the last frame to open a copy context menu.
+	for evs.rowClicks.Len() < evs.filteredEvents.Len() {
+		evs.rowClicks.Grow()
+	}
+	for i := 0; i < evs.filteredEvents.Len(); i++ {
+		for _, click := range evs.rowClicks.Ptr(i).Update(gtx.Queue) {
+			if click.Kind == gesture.KindPress && click.Button == pointer.ButtonSecondary {
+				evs.setRowContextMenu(win, evs.filteredEvents.At(i))
+			}
+		}
+	}
+
 	evs.timestampObjects.Reset()
 	evs.prevSpans = evs.prevSpans[:0]
 
 	var txtCnt int
 	cellFn := func(win *theme.Window, gtx layout.Context, row, col int) layout.Dimensions {
 		defer clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops).Pop()
+
+		// Register the row's click gesture over the whole cell so a right-click
+		// anywhere on the row opens the copy context menu.
+		evs.rowClicks.Ptr(row).Add(gtx.Ops)
 
 		var txt *Text
 		if txtCnt < evs.texts.Len() {
@@ -354,6 +466,12 @@ func (evs *EventList) Layout(win *theme.Window, gtx layout.Context) layout.Dimen
 				return widestCheckbox.Dimensions
 			})
 		},
+		layout.Spacer{Height: 5}.Layout,
+		func(gtx layout.Context) layout.Dimensions {
+			gtx.Constraints.Min.X = 0
+			return theme.Button(win.Theme, &evs.copyAsCSV.Clickable, "Copy as CSV").Layout(win, gtx)
+		},
+		layout.Spacer{Height: 5}.Layout,
 		func(gtx layout.Context) layout.Dimensions {
 			gtx.Constraints.Min = gtx.Constraints.Max
 
